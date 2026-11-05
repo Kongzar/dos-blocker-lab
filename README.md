@@ -1,9 +1,10 @@
-# DoS Mitigation Lab — Rate Limiting + Automated IP Banning
+# DoS Mitigation Lab — Rate Limiting, Automated IP Banning & SYN Flood Defense
 
-A self-contained, isolated VM lab built to test and verify two layers of denial-of-service
-defense against a simulated flood attack: **Nginx request rate limiting** and
-**fail2ban automated IP banning**. Everything below — the config, the attack, and the
-results — was run and captured by me in my own VirtualBox environment.
+A self-contained, isolated VM lab built to test and verify denial-of-service defenses at two
+different layers of the stack: **application-layer** (Nginx request rate limiting +
+fail2ban automated IP banning) and **transport-layer** (iptables SYN flood mitigation).
+Everything below — the config, the attacks, and the results — was run and captured by me in
+my own VirtualBox environment.
 
 > **AI disclosure:** I used Claude (Anthropic) as a guided assistant throughout this project —
 > for explaining concepts, walking through command syntax, and helping debug errors as they
@@ -82,8 +83,9 @@ sequenceDiagram
 | **OS admin** | Ubuntu Server (headless, CLI-only) — package management, `systemctl`, log inspection |
 | **Web server config** | Nginx — `limit_req_zone`, `limit_req`, config syntax validation (`nginx -t`), service reload |
 | **Intrusion prevention** | fail2ban — custom filter regex, custom jail definition, `fail2ban-client` operations |
-| **Offensive tooling (lab only)** | Kali Linux, Apache Bench (`ab`) for load generation |
-| **Networking fundamentals** | Host-only vs. NAT vs. Bridged adapters, IP addressing, connectivity verification (`ping`, `curl`) |
+| **Offensive tooling (lab only)** | Kali Linux, Apache Bench (`ab`) and `hping3` for load/flood generation |
+| **Firewall / packet filtering** | `iptables` — SYN rate limiting, `connlimit` per-IP caps, rule counters for verification |
+| **Networking fundamentals** | Host-only vs. NAT vs. Bridged adapters, IP addressing, TCP handshake mechanics (SYN/SYN-ACK/ACK), connectivity verification (`ping`, `curl`, `ss`) |
 | **Linux CLI** | `nano`, file permissions, `systemctl`, `journalctl`, log tailing, regex-based log filters |
 | **Debugging under pressure** | Diagnosed and fixed a broken config directive, a service-not-running error, and multiple command typos using service logs (`journalctl -xeu`) rather than guesswork |
 
@@ -105,6 +107,16 @@ sequenceDiagram
 - **Isolate before you attack, even in a lab.** Keeping the attacker VM off NAT/Bridged
   networking the whole time meant I could run real flood traffic without any risk to my own
   machine or network — a habit I'd carry into any future pentesting work.
+- **Application-layer and transport-layer attacks need different defenses.** Nginx's
+  `limit_req` had zero effect on the SYN flood — it never even saw those packets, because
+  `iptables` operates a layer below the web server. Fixing "my site is slow under load" and
+  fixing "my connection table is being exhausted" are genuinely different problems with
+  different tools.
+- **A SYN flood doesn't need a response to do damage.** Kali's `hping3 --flood` never read a
+  single reply — the attack's entire effect came from Ubuntu's kernel doing work (allocating
+  half-open connection state) in response to packets the attacker could fire and forget.
+  Understanding that asymmetry is the whole reason SYN floods are cheap to launch and
+  expensive to absorb without rate limiting.
 
 ---
 
@@ -145,7 +157,68 @@ at the firewall).
 
 ---
 
-## Config excerpts
+## Round 2 — SYN flood + iptables (transport-layer defense)
+
+The first round (above) defended against an **application-layer** flood — real HTTP requests
+that Nginx had to parse. This round tests a **transport-layer** attack instead: a TCP SYN
+flood, which never completes the handshake and tries to exhaust the server's connection table
+before Nginx is even involved. Rate-limiting at the Nginx level doesn't help here — the defense
+has to live at the firewall (`iptables`), one layer below the web server.
+
+### The attack
+```bash
+sudo hping3 -S -p 80 --flood 192.168.56.4
+```
+`-S` sends SYN-only packets as fast as possible, deliberately never sending the final ACK —
+each one leaves a half-open connection sitting in the kernel's backlog.
+
+### Defenses added
+```bash
+# Rate-limit new SYN packets per source (5/sec, burst 10)
+sudo iptables -A INPUT -p tcp --syn -m limit --limit 5/second --limit-burst 10 -j ACCEPT
+sudo iptables -A INPUT -p tcp --syn -j DROP
+
+# Cap concurrent half-open connections per source IP
+sudo iptables -A INPUT -p tcp --syn -m connlimit --connlimit-above 20 -j DROP
+
+# Kernel-level SYN cookie protection
+sudo sysctl -w net.ipv4.tcp_syncookies=1
+```
+
+### Measuring the effect
+Tracked half-open connections live during each flood:
+```bash
+watch -n1 'ss -tan state syn-recv | wc -l'
+```
+
+| | Before iptables rules | After iptables rules |
+|---|---|---|
+| Half-open (SYN-RECV) connections during flood | **513** | **160** |
+
+![Half-open connection count before iptables rules — 513](assets/06-syn-flood-before-iptables.jpg)
+![Half-open connection count after iptables rules — 160](assets/07-syn-flood-after-iptables.jpg)
+
+That's roughly a **69% reduction** — and just as important, the count stayed bounded instead of
+climbing unchecked the way it did before any firewall rule existed.
+
+### Confirming the rule actually did the work
+```bash
+sudo iptables -L INPUT -v -n
+```
+```
+637    packets  ACCEPT   tcp  --  *  *  0.0.0.0/0  0.0.0.0/0   tcp flags:0x17/0x02 limit: avg 5/sec burst 10
+37452  packets  DROP     tcp  --  *  *  0.0.0.0/0  0.0.0.0/0   tcp flags:0x17/0x02
+0      packets  DROP     tcp  --  *  *  0.0.0.0/0  0.0.0.0/0   tcp flags:0x17/0x02 #conn src/32 > 20
+```
+![iptables counters showing 37,452 SYN packets dropped](assets/08-iptables-drop-counters.jpg)
+
+**37,452 SYN packets were dropped** by the rate-limit rule — only 637 were let through as
+legitimate. The `connlimit` rule never fired at all (0 packets), because the rate limiter was
+already catching almost everything before any single source could open 20+ concurrent
+half-open connections. That told me the rate-limit rule was doing effectively all the work in
+this test, and the connlimit rule was a backstop that never got exercised.
+
+
 
 **`nginx.conf`** (inside the `http {}` block):
 ```nginx
@@ -179,10 +252,10 @@ bantime = 300
 
 ## Next steps I'm considering
 
-- Simulating a lower-level SYN flood with `hping3 --flood` to test whether rate limiting +
-  fail2ban is sufficient against transport-layer attacks, or whether firewall-level (`iptables`)
-  rules are also needed
-- Tightening `burst` and re-testing to map the threshold more precisely
+- Tightening the `limit_req` burst value and the `iptables` SYN rate, and re-testing to map
+  both thresholds more precisely
+- Isolating the effect of `tcp_syncookies` on its own (currently tested only alongside the
+  iptables rate-limit rule, not in isolation)
 - Comparing this against a cloud WAF (AWS WAF / Cloudflare) rate-limiting setup as part of my
   broader cloud security learning path
 
@@ -199,5 +272,8 @@ dos-blocker-lab/
     ├── 02-nginx-rate-limit-log.jpg
     ├── 03-nginx-config-test-success.png
     ├── 04-fail2ban-jail-status.jpg
-    └── 05-fail2ban-ip-banned.jpg
+    ├── 05-fail2ban-ip-banned.jpg
+    ├── 06-syn-flood-before-iptables.jpg
+    ├── 07-syn-flood-after-iptables.jpg
+    └── 08-iptables-drop-counters.jpg
 ```
